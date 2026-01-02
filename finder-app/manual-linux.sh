@@ -1,80 +1,136 @@
 #!/bin/bash
-# Script outline to install and build kernel.
-# Author: Siddhant Jajoo.
+# Manual Linux kernel + rootfs build for Assignment 3 Part 2
+# Fully automated, non-interactive
 
 set -e
 set -u
 
 OUTDIR=/tmp/aeld
-KERNEL_REPO=git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
+KERNEL_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
 KERNEL_VERSION=v5.15.163
-BUSYBOX_VERSION=1_33_1
-FINDER_APP_DIR=$(realpath $(dirname $0))
+BUSYBOX_VERSION=1.33.1
 ARCH=arm64
 CROSS_COMPILE=aarch64-none-linux-gnu-
+FINDER_APP_DIR=$(realpath $(dirname $0))
 
-if [ $# -lt 1 ]
-then
-	echo "Using default directory ${OUTDIR} for output"
+# -------- outdir handling --------
+if [ $# -ge 1 ]; then
+    OUTDIR=$(realpath $1)
+    echo "Using passed directory ${OUTDIR} for output"
 else
-	OUTDIR=$1
-	echo "Using passed directory ${OUTDIR} for output"
+    echo "Using default directory ${OUTDIR} for output"
 fi
 
-mkdir -p ${OUTDIR}
+mkdir -p "${OUTDIR}"
 
-cd "$OUTDIR"
-if [ ! -d "${OUTDIR}/linux-stable" ]; then
-    #Clone only if the repository does not exist.
-	echo "CLONING GIT LINUX STABLE VERSION ${KERNEL_VERSION} IN ${OUTDIR}"
-	git clone ${KERNEL_REPO} --depth 1 --single-branch --branch ${KERNEL_VERSION}
-fi
-if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
-    cd linux-stable
-    echo "Checking out version ${KERNEL_VERSION}"
-    git checkout ${KERNEL_VERSION}
+##################################
+# Build Linux Kernel
+##################################
+cd "${OUTDIR}"
 
-    # TODO: Add your kernel build steps here
+if [ ! -d linux-stable ]; then
+    echo "Cloning Linux kernel ${KERNEL_VERSION}"
+    git clone ${KERNEL_REPO} --depth 1 --branch ${KERNEL_VERSION} linux-stable
 fi
 
-echo "Adding the Image in outdir"
+cd linux-stable
 
-echo "Creating the staging directory for the root filesystem"
-cd "$OUTDIR"
-if [ -d "${OUTDIR}/rootfs" ]
-then
-	echo "Deleting rootfs directory at ${OUTDIR}/rootfs and starting over"
-    sudo rm  -rf ${OUTDIR}/rootfs
+if [ ! -f arch/${ARCH}/boot/Image ]; then
+    echo "Building Linux kernel"
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+    make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
 fi
 
-# TODO: Create necessary base directories
+cp arch/${ARCH}/boot/Image "${OUTDIR}/Image"
+echo "Kernel Image copied to ${OUTDIR}/Image"
 
-cd "$OUTDIR"
-if [ ! -d "${OUTDIR}/busybox" ]
-then
-git clone git://busybox.net/busybox.git
-    cd busybox
-    git checkout ${BUSYBOX_VERSION}
-    # TODO:  Configure busybox
-else
-    cd busybox
+##################################
+# Create Root Filesystem
+##################################
+cd "${OUTDIR}"
+sudo rm -rf rootfs
+mkdir -p rootfs
+
+cd rootfs
+mkdir -p bin sbin etc proc sys dev lib lib64 home
+
+##################################
+# Build BusyBox (static)
+##################################
+cd "${OUTDIR}"
+
+if [ ! -d busybox ]; then
+    echo "Downloading BusyBox ${BUSYBOX_VERSION}"
+    wget --no-check-certificate \
+        https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
+    tar -xjf busybox-${BUSYBOX_VERSION}.tar.bz2
+    mv busybox-${BUSYBOX_VERSION} busybox
 fi
 
-# TODO: Make and install busybox
+cd busybox
+make distclean
+make defconfig
 
-echo "Library dependencies"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+# Enable static build
+sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 
-# TODO: Add library dependencies to rootfs
+make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
+make CONFIG_PREFIX="${OUTDIR}/rootfs" ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} install
 
-# TODO: Make device nodes
+##################################
+# Add Library Dependencies
+##################################
+SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
 
-# TODO: Clean and build the writer utility
+cp -a ${SYSROOT}/lib/* "${OUTDIR}/rootfs/lib/" || true
+cp -a ${SYSROOT}/lib64/* "${OUTDIR}/rootfs/lib64/" || true
 
-# TODO: Copy the finder related scripts and executables to the /home directory
-# on the target rootfs
+##################################
+# Create Device Nodes
+##################################
+sudo mknod -m 666 "${OUTDIR}/rootfs/dev/null" c 1 3
+sudo mknod -m 600 "${OUTDIR}/rootfs/dev/console" c 5 1
 
-# TODO: Chown the root directory
+##################################
+# Build writer (Assignment 2)
+##################################
+cd "${FINDER_APP_DIR}"
+make clean
+make CROSS_COMPILE=${CROSS_COMPILE}
+cp writer "${OUTDIR}/rootfs/home/"
 
-# TODO: Create initramfs.cpio.gz
+##################################
+# Copy finder scripts and config
+##################################
+cd "${OUTDIR}/rootfs/home"
+
+cp "${FINDER_APP_DIR}/finder.sh" .
+cp "${FINDER_APP_DIR}/finder-test.sh" .
+cp "${FINDER_APP_DIR}/autorun-qemu.sh" .
+
+mkdir -p conf
+cp "${FINDER_APP_DIR}/../conf/username.txt" conf/
+cp "${FINDER_APP_DIR}/../conf/assignment.txt" conf/
+
+# Fix finder-test.sh path
+sed -i 's|../conf/assignment.txt|conf/assignment.txt|' finder-test.sh
+
+chmod +x finder.sh finder-test.sh autorun-qemu.sh
+
+##################################
+# Ownership
+##################################
+cd "${OUTDIR}/rootfs"
+sudo chown -R root:root .
+
+##################################
+# Create initramfs
+##################################
+find . | cpio -H newc -ov --owner root:root | gzip > "${OUTDIR}/initramfs.cpio.gz"
+
+echo "----------------------------------------"
+echo "Build complete!"
+echo "Kernel Image: ${OUTDIR}/Image"
+echo "Initramfs:    ${OUTDIR}/initramfs.cpio.gz"
+echo "----------------------------------------"
+
